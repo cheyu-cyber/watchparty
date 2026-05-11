@@ -59,8 +59,27 @@ class WatchParty extends React.Component {
         }
       });
     } else {
-      // Firebase isn't set up so enable subscriber features
+      // Firebase isn't set up — single-user self-hosted mode.
+      // Beyond enabling subscriber features, we also synthesize a
+      // minimal user object so the UI doesn't disable owner-only
+      // features (make-permanent toggle, room locks, kick, vanity URL,
+      // etc.) on `!Boolean(user)` checks.
+      //
+      // The uid mirrors the browser's persistent localStorage clientId
+      // — the same value the server now adopts as socket.uid when
+      // Firebase isn't configured (see server/room.ts).  This keeps
+      // client and server agreeing on identity without any real auth.
+      const clientId =
+        window.localStorage.getItem("watchparty-clientid") ?? "local-user";
+      const fakeUser = {
+        uid: clientId,
+        displayName: null,
+        email: null,
+        photoURL: null,
+        getIdToken: async () => "local",
+      } as unknown as firebase.User;
       this.setState({
+        user: fakeUser,
         isSubscriber: true,
       });
     }

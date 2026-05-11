@@ -217,8 +217,24 @@ export class Room {
       io.of(roomId).emit("roster", this.getRosterForApp());
 
       socket.clientId = clientId;
-      socket.uid = "";
-      socket.isSub = false;
+      // Self-hosted single-user mode: when Firebase Admin SDK isn't
+      // configured we have no real auth, but features like permanent
+      // rooms, room passwords, kick-user, and custom vanity URLs all
+      // gate on socket.uid being non-empty (and many also check
+      // socket.isSub).  Use the per-browser clientId (a UUID persisted
+      // in localStorage by getOrCreateClientId()) as the synthetic uid
+      // so each browser has a stable identity that can own rooms it
+      // creates.  isSub is forced true to unlock subscriber-only
+      // features — there's no Stripe in self-hosted mode, so this just
+      // mirrors what getIsSubscriberByEmail() already does (returns
+      // true unconditionally when STRIPE_SECRET_KEY is empty).
+      if (!config.FIREBASE_ADMIN_SDK_CONFIG) {
+        socket.uid = clientId;
+        socket.isSub = true;
+      } else {
+        socket.uid = "";
+        socket.isSub = false;
+      }
 
       // Check if this socket matches this.lock UID
       const validateLock = () => {
