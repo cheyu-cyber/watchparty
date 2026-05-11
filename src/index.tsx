@@ -29,6 +29,44 @@ const Debug = lazy(() => import("./components/Debug/Debug"));
 const firebaseConfig = config.VITE_FIREBASE_CONFIG;
 if (firebaseConfig) {
   firebase.initializeApp(JSON.parse(firebaseConfig));
+} else {
+  // Self-host mode: no real Firebase project.  Initialize with stub
+  // values so any unconditional ``firebase.auth()`` / ``firebase.app()``
+  // call elsewhere in the React tree (or in a transitively imported
+  // module) doesn't crash with "No Firebase App '[DEFAULT]' has been
+  // created".  The default app exists, the auth singleton exists, and
+  // any ``onAuthStateChanged`` listener fires once with ``null`` and
+  // then stops — exactly what we want, since the synthesized fakeUser
+  // below is the only user that should ever flow through React state.
+  //
+  // The values themselves are nonsense but syntactically valid; they
+  // never reach the network because we never call signIn* anywhere
+  // when ``firebaseConfig`` is empty (LoginModal/ProfileModal trigger
+  // on user click, and the sign-in button is hidden whenever
+  // ``user`` is truthy — which it always is in self-host mode).
+  firebase.initializeApp({
+    apiKey: "self-host-stub",
+    authDomain: "localhost",
+    projectId: "self-host-stub",
+    appId: "1:0:web:0",
+  });
+
+  // Defensive cleanup: if the user previously ran against the upstream
+  // hardcoded Firebase fallback (watchparty-273604), their browser
+  // localStorage may still have ``firebase:authUser:*`` keys for that
+  // project.  Those keys would otherwise persist forever and confuse
+  // future debugging.  Harmless to remove — the stub app has a
+  // different appId so Firebase wouldn't try to rehydrate them anyway.
+  try {
+    for (let i = window.localStorage.length - 1; i >= 0; i--) {
+      const key = window.localStorage.key(i);
+      if (key && key.startsWith("firebase:")) {
+        window.localStorage.removeItem(key);
+      }
+    }
+  } catch {
+    // SecurityError in private/incognito modes; ignore.
+  }
 }
 
 // Redirect old-style URLs
