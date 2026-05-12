@@ -1593,6 +1593,37 @@ export class App extends React.Component<AppProps, AppState> {
               pc.addTrack(track, this.localStreamToPublish);
             }
           });
+          // Quality patch (self-host): override the video sender's
+          // default encoding parameters to lift the bitrate ceiling
+          // and prefer dropping framerate over resolution when
+          // bandwidth tightens (the right call for movie / screen-
+          // share content where soft frames look worse than judder).
+          //
+          // Chrome's auto-negotiated VP8 screen-share ceiling is
+          // ~2 Mbps; we get a sharper 1080p60 with no other code
+          // changes by lifting it to config.VITE_MAX_VIDEO_BITRATE_KBPS
+          // (default 8 Mbps, configurable per-deploy).
+          //
+          // Runs after addTrack so getSenders() returns the actual
+          // RTPSender for this connection.  Wrapped in try/catch
+          // because setParameters() is async and rejects rather than
+          // throws on older browsers — we just want to log and
+          // continue rather than break the connection setup.
+          pc.getSenders().forEach((sender) => {
+            if (sender.track?.kind !== "video") return;
+            const params = sender.getParameters();
+            if (!params.encodings) {
+              params.encodings = [{}];
+            }
+            params.encodings[0].maxBitrate =
+              config.VITE_MAX_VIDEO_BITRATE_KBPS * 1000;
+            params.encodings[0].priority = "high";
+            params.encodings[0].networkPriority = "high";
+            params.degradationPreference = "maintain-resolution";
+            sender.setParameters(params).catch((err) => {
+              console.warn("[quality] setParameters failed:", err);
+            });
+          });
           pc.onicecandidate = (event) => {
             // We generated an ICE candidate, send it to peer
             if (event.candidate) {
