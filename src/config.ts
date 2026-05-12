@@ -19,21 +19,23 @@ export default {
     "pk_live_eVMbIifj5lnvgBleBCRaCv4E00aeXQkPxQ",
   VITE_FIREBASE_SIGNIN_METHODS: "facebook,google,email",
   // Maximum video bitrate per peer for screen / file share in P2P
-  // (Free) mode, in kbps.  Default 8000 = 8 Mbps, which is well above
-  // Chrome's auto-negotiated VP8 ceiling (~2 Mbps) for screen share
-  // and gives 1080p60 visibly better quality.
+  // (Free) mode, in kbps.  Default 4000 = 4 Mbps, sized for typical
+  // residential upload (25 Mbps) with a comfortable 3–4 viewer
+  // budget.  Combined with the VP9 codec preference below this
+  // produces visibly sharper output than upstream's auto-negotiated
+  // VP8 / ~2 Mbps default.
   //
-  // Trade-off: every viewer consumes this much of your *upload*
-  // bandwidth.  Pick a value such that
+  // Trade-off: every viewer consumes this much of your *upload*.
+  // Pick a value such that
   //   VITE_MAX_VIDEO_BITRATE_KBPS × <max viewers> < <upload speed kbps>
   // Examples for common upload speeds:
-  //   25 Mbps up, 3 viewers   → 8000 (the default) is fine
-  //   25 Mbps up, 5 viewers   → drop to 4000
-  //   100 Mbps up, 5 viewers  → can push to 15000 (1080p60 looks great)
+  //   25 Mbps up, 3 viewers   → 4000 (the default) is fine
+  //   25 Mbps up, 5 viewers   → drop to 3000
+  //   100 Mbps up, 5 viewers  → can push to 12000
   // Override at build time:
   //   VITE_MAX_VIDEO_BITRATE_KBPS=12000 docker compose build app --no-cache
   VITE_MAX_VIDEO_BITRATE_KBPS: Number(
-    import.meta.env.VITE_MAX_VIDEO_BITRATE_KBPS ?? 8000,
+    import.meta.env.VITE_MAX_VIDEO_BITRATE_KBPS ?? 4000,
   ),
   NODE_ENV: import.meta.env.DEV ? "development" : "production",
 };

@@ -1624,6 +1624,57 @@ export class App extends React.Component<AppProps, AppState> {
               console.warn("[quality] setParameters failed:", err);
             });
           });
+          // Prefer VP9 over the browser default (VP8) for video.
+          // Same bitrate → ~30 % sharper image with VP9; conversely
+          // we can run at a lower bitrate and still look as good as
+          // upstream's VP8 output.  AV1 deliberately excluded — the
+          // trash-can's E5-1620v2 has no hardware AV1 encoder and
+          // software AV1 at 1080p60 starves the encoder, causing
+          // frame drops that look worse than the codec gain.
+          //
+          // setCodecPreferences() must run synchronously here (after
+          // addTrack, before the async onnegotiationneeded fires
+          // createOffer) so the SDP offer reflects our ordering.
+          // RTCRtpSender.getCapabilities() may be missing on very
+          // old browsers; the whole block is guarded.
+          try {
+            const caps = RTCRtpSender.getCapabilities?.("video");
+            if (caps?.codecs?.length) {
+              // mimeType match is case-insensitive in spec; use
+              // toLowerCase() to be safe across browser
+              // implementations.
+              const pickByMime = (mime: string) =>
+                caps.codecs.filter(
+                  (c) => c.mimeType.toLowerCase() === mime,
+                );
+              const ordered = [
+                ...pickByMime("video/vp9"),
+                ...pickByMime("video/vp8"),
+                // RTX / FEC / red are required *alongside* the
+                // primary codecs — Chrome will refuse the offer
+                // (InvalidAccessError) if we strip them, so we
+                // keep them at the end of the preference list.
+                ...caps.codecs.filter((c) =>
+                  ["video/rtx", "video/ulpfec", "video/red"].includes(
+                    c.mimeType.toLowerCase(),
+                  ),
+                ),
+              ];
+              if (ordered.length > 0) {
+                pc.getTransceivers().forEach((tr) => {
+                  if (tr.sender?.track?.kind === "video") {
+                    try {
+                      tr.setCodecPreferences(ordered);
+                    } catch (err) {
+                      console.warn("[quality] setCodecPreferences failed:", err);
+                    }
+                  }
+                });
+              }
+            }
+          } catch (err) {
+            console.warn("[quality] codec capability probe failed:", err);
+          }
           pc.onicecandidate = (event) => {
             // We generated an ICE candidate, send it to peer
             if (event.candidate) {
