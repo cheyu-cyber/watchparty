@@ -153,12 +153,26 @@ export class ListRoomsButton extends React.Component<{}> {
   }
 
   refreshRooms = async () => {
-    if (this.context.user) {
+    if (!this.context.user) return;
+    try {
       const token = await this.context.user.getIdToken();
       const response = await fetch(
         serverPath + `/listRooms?uid=${this.context.user?.uid}&token=${token}`,
       );
-      this.setState({ rooms: await response.json() });
+      // Defend the render(): rooms.map() crashes the entire React
+      // tree if the server returned a non-array body (e.g. an error
+      // object like {error: "invalid user token"}, or a string for
+      // 400/500).  Without this guard we get a Black-Screen-Of-
+      // Watchparty when listRooms fails for any reason.
+      if (!response.ok) {
+        this.setState({ rooms: [] });
+        return;
+      }
+      const body = await response.json();
+      this.setState({ rooms: Array.isArray(body) ? body : [] });
+    } catch {
+      // Network error, JSON parse failure — same fallback.
+      this.setState({ rooms: [] });
     }
   };
 
