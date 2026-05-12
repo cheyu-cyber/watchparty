@@ -108,6 +108,23 @@ export class SignInButton extends React.Component<SignInButtonProps> {
         </div>
       );
     }
+    // Self-host mode (VITE_FIREBASE_CONFIG empty): no real Firebase
+    // project is wired up, so the Sign In button MUST stay hidden —
+    // clicking it would open LoginModal, whose form handlers call
+    // firebase.auth().signInWithEmailAndPassword() and similar.
+    // Those hit the stub Firebase config and fail with an opaque
+    // network error that React's default boundary doesn't catch,
+    // black-screening the whole app.
+    //
+    // The synthesized fakeUser in index.tsx normally suppresses this
+    // branch (the user-truthy branch above renders the Avatar instead),
+    // but on the very first paint — before componentDidMount fires —
+    // user is still undefined, so the Sign In button briefly flashes.
+    // A click during that window is enough to trigger the crash.
+    if (!config.VITE_FIREBASE_CONFIG) {
+      return null;
+    }
+
     return (
       <React.Fragment>
         {this.state.isLoginOpen && (
