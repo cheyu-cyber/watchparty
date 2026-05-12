@@ -838,21 +838,31 @@ export class App extends React.Component<AppProps, AppState> {
           msg.sdp.sdp = _sdp;
           await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
           const answer = await pc.createAnswer();
-          // Allow stereo audio
+          // Allow stereo audio.  Bitrate is configurable via
+          // VITE_AUDIO_BITRATE_KBPS (default 128) — upstream hardcoded
+          // 510 kbps which is lossless-overkill for typical music /
+          // movie content; 128 kbps Opus stereo is ABX-indistinguishable
+          // from source on music and matches premium streaming services.
+          const stereoBitrate =
+            config.VITE_AUDIO_BITRATE_KBPS * 1000;
           answer.sdp = answer.sdp?.replace(
             "useinbandfec=1",
-            "useinbandfec=1; stereo=1; maxaveragebitrate=510000",
+            `useinbandfec=1; stereo=1; maxaveragebitrate=${stereoBitrate}`,
           );
-          // console.log(answer.sdp);
-          // Allow multichannel audio if Chromium
-          //@ts-expect-error
+          // Allow multichannel audio if Chromium.  Multiopus carries
+          // 6 discrete channels (5.1 surround), so we budget 3× the
+          // stereo bitrate by default — keeps per-channel quality
+          // roughly equivalent to the stereo path.
+          //@ts-expect-error  // window.chrome is non-standard
           const isChromium = Boolean(window.chrome);
           if (isChromium) {
+            const multiopusBitrate =
+              config.VITE_MULTIOPUS_BITRATE_KBPS * 1000;
             answer.sdp = answer.sdp
               ?.replace("opus/48000/2", "multiopus/48000/6")
               .replace(
                 "useinbandfec=1",
-                "channel_mapping=0,4,1,2,3,5; num_streams=4; coupled_streams=2;maxaveragebitrate=510000;minptime=10;useinbandfec=1",
+                `channel_mapping=0,4,1,2,3,5; num_streams=4; coupled_streams=2;maxaveragebitrate=${multiopusBitrate};minptime=10;useinbandfec=1`,
               );
           }
           await pc.setLocalDescription(answer);

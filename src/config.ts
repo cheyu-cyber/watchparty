@@ -36,7 +36,26 @@ export default {
   // Override at build time:
   //   VITE_MAX_VIDEO_BITRATE_KBPS=12000 docker compose build app --no-cache
   VITE_MAX_VIDEO_BITRATE_KBPS: Number(
-    import.meta.env.VITE_MAX_VIDEO_BITRATE_KBPS ?? 3600,
+    import.meta.env.VITE_MAX_VIDEO_BITRATE_KBPS ?? 3200,
+  ),
+  // Opus audio bitrate for screen / file share, in kbps.  Upstream
+  // hardcoded 510 kbps (effectively lossless overkill) for both the
+  // stereo and 5.1 paths.  Opus is so efficient that:
+  //   * 128 kbps stereo  — ABX-indistinguishable from source on music;
+  //                        matches YouTube Premium / Spotify "very high"
+  //   * 384 kbps multiopus (5.1, 6 channels) — same per-channel budget
+  //                        as stereo at 128, surround stays clean
+  // Saves ~382 kbps per viewer on stereo content vs the old 510 kbps,
+  // which together with the 3.2 Mbps video ceiling lets us fit roughly
+  // one extra viewer per 4 Mbps of upload headroom.
+  //
+  // Override at build time:
+  //   VITE_AUDIO_BITRATE_KBPS=192 docker compose build app --no-cache
+  VITE_AUDIO_BITRATE_KBPS: Number(
+    import.meta.env.VITE_AUDIO_BITRATE_KBPS ?? 128,
+  ),
+  VITE_MULTIOPUS_BITRATE_KBPS: Number(
+    import.meta.env.VITE_MULTIOPUS_BITRATE_KBPS ?? 384,
   ),
   NODE_ENV: import.meta.env.DEV ? "development" : "production",
 };
