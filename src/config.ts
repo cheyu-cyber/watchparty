@@ -35,6 +35,17 @@ export default {
   VITE_MAX_VIDEO_BITRATE_KBPS: Number(
     import.meta.env.VITE_MAX_VIDEO_BITRATE_KBPS ?? 3000,
   ),
+  // Frame-rate cap for screen / file share.  Applied both to the
+  // getDisplayMedia() capture request and to the video sender's
+  // encoding (maxFramerate), so local-file shares of 50/60 fps
+  // sources are capped too.  Was 60; 1080p60 streams were unstable,
+  // and at the same bitrate 30 fps gives each frame twice the bits.
+  //
+  // Override at build time:
+  //   VITE_MAX_VIDEO_FRAMERATE=60 docker compose build app --no-cache
+  VITE_MAX_VIDEO_FRAMERATE: Number(
+    import.meta.env.VITE_MAX_VIDEO_FRAMERATE ?? 30,
+  ),
   // Opus audio bitrate for screen / file share, in kbps.  Upstream
   // hardcoded 510 kbps (effectively lossless overkill) for both the
   // stereo and 5.1 paths.  Opus is so efficient that:

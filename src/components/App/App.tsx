@@ -1228,8 +1228,12 @@ export class App extends React.Component<AppProps, AppState> {
   startScreenShare = async (useMediaSoup: boolean) => {
     if (navigator.mediaDevices.getDisplayMedia) {
       const stream = await navigator.mediaDevices.getDisplayMedia({
-        //@ts-expect-error
-        video: { height: 1080, frameRate: 60, logicalSurface: true },
+        video: {
+          height: 1080,
+          frameRate: config.VITE_MAX_VIDEO_FRAMERATE,
+          //@ts-expect-error
+          logicalSurface: true,
+        },
         audio: {
           autoGainControl: false,
           channelCount: 2,
@@ -1696,9 +1700,10 @@ export class App extends React.Component<AppProps, AppState> {
           // share content where soft frames look worse than judder).
           //
           // Chrome's auto-negotiated VP8 screen-share ceiling is
-          // ~2 Mbps; we get a sharper 1080p60 with no other code
+          // ~2 Mbps; we get a sharper 1080p with no other code
           // changes by lifting it to config.VITE_MAX_VIDEO_BITRATE_KBPS
-          // (default 8 Mbps, configurable per-deploy).
+          // and capping frame rate at config.VITE_MAX_VIDEO_FRAMERATE
+          // (both configurable per-deploy, see src/config.ts).
           //
           // Runs after addTrack so getSenders() returns the actual
           // RTPSender for this connection.  Wrapped in try/catch
@@ -1713,6 +1718,7 @@ export class App extends React.Component<AppProps, AppState> {
             }
             params.encodings[0].maxBitrate =
               config.VITE_MAX_VIDEO_BITRATE_KBPS * 1000;
+            params.encodings[0].maxFramerate = config.VITE_MAX_VIDEO_FRAMERATE;
             params.encodings[0].priority = "high";
             params.encodings[0].networkPriority = "high";
             params.degradationPreference = "maintain-resolution";
