@@ -14,9 +14,6 @@ export default {
   // at build time via `VITE_FIREBASE_CONFIG=<json> npm run build` if a
   // future operator wants to wire up their own Firebase project.
   VITE_FIREBASE_CONFIG: import.meta.env.VITE_FIREBASE_CONFIG ?? "",
-  VITE_STRIPE_PUBLIC_KEY:
-    import.meta.env.VITE_STRIPE_PUBLIC_KEY ??
-    "pk_live_eVMbIifj5lnvgBleBCRaCv4E00aeXQkPxQ",
   VITE_FIREBASE_SIGNIN_METHODS: "facebook,google,email",
   // Maximum video bitrate per peer for screen / file share in P2P
   // (Free) mode, in kbps.  Default 3600 = 3.6 Mbps, dialled down

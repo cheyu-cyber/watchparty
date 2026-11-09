@@ -19,10 +19,11 @@ import {
   isHls,
   isScreenShare,
   isFileShare,
+  isDirectVideoUrl,
+  pickSingleLargeFile,
   isVBrowser,
   isDash,
   VIDEO_MAX_HEIGHT_CSS,
-  createUuid,
   softWhite,
   getSavedPasswords,
 } from "../../utils/utils";
@@ -42,6 +43,11 @@ import { ErrorModal } from "../Modal/ErrorModal";
 import { PasswordModal } from "../Modal/PasswordModal";
 import { ScreenShareModal } from "../Modal/ScreenShareModal";
 import { FileShareModal } from "../Modal/FileShareModal";
+import {
+  ClientTranscoder,
+  isClientTranscodeSupported,
+  type AudioTrackInfo,
+} from "../../utils/clientTranscode";
 import firebase from "firebase/compat/app";
 import { SubtitleModal } from "../Modal/SubtitleModal";
 import { HTML } from "./HTML";
@@ -50,12 +56,20 @@ import styles from "./App.module.css";
 import config from "../../config";
 import { MetadataContext } from "../../MetadataContext";
 import ChatVideoCard from "../ChatVideoCard/ChatVideoCard";
-import { ActionIcon, Badge, TextInput, Button } from "@mantine/core";
+import {
+  ActionIcon,
+  Badge,
+  TextInput,
+  Button,
+  Switch,
+  Tooltip,
+} from "@mantine/core";
 import {
   IconAntennaBars5,
   IconBrowser,
   IconChevronLeft,
   IconChevronRight,
+  IconDeviceMobile,
   IconFile,
   IconKeyboardFilled,
   IconList,
@@ -139,6 +153,7 @@ interface AppState {
   settings: Settings;
   vBrowserResolution: string;
   vBrowserQuality: string;
+  vBrowserTouchControls: boolean;
   isVBrowserLarge: boolean;
   nonPlayableMedia: boolean;
   currentTab: string;
@@ -169,7 +184,11 @@ interface AppState {
   roomPlaybackRate: number;
   isLiveStream: boolean;
   settingsModalOpen: boolean;
-  uploadController: AbortController | undefined;
+  convertProgress: number | undefined;
+  convertEnabled: boolean;
+  // Audio tracks of the file being converted on this device, and which one is playing
+  audioTracks: AudioTrackInfo[] | undefined;
+  audioTrackId: number | undefined;
 }
 
 export class App extends React.Component<AppProps, AppState> {
@@ -208,6 +227,8 @@ export class App extends React.Component<AppProps, AppState> {
     settings: {},
     vBrowserResolution: "1280x720@30",
     vBrowserQuality: "1",
+    vBrowserTouchControls:
+      isMobile() || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent),
     isVBrowserLarge: false,
     nonPlayableMedia: false,
     currentTab:
@@ -250,7 +271,10 @@ export class App extends React.Component<AppProps, AppState> {
     roomPlaybackRate: 0,
     isLiveStream: false,
     settingsModalOpen: false,
-    uploadController: undefined,
+    convertProgress: undefined,
+    convertEnabled: window.localStorage.getItem("watchparty-convert") === "1",
+    audioTracks: undefined,
+    audioTrackId: undefined,
   };
   socket: Socket = null!;
   mediasoupPubSocket: Socket | null = null;
@@ -258,6 +282,7 @@ export class App extends React.Component<AppProps, AppState> {
   ytDebounce = true;
   localStreamToPublish?: MediaStream;
   isLocalStreamAFile = false;
+  transcoder?: ClientTranscoder;
   publisherConns: PCDict = {};
   consumerConn?: RTCPeerConnection;
   progressUpdater?: number;
@@ -471,6 +496,7 @@ export class App extends React.Component<AppProps, AppState> {
           // Stop all players
           // Unless the user is sharing a file, because we play it in leftVideo and capture stream
           if (!this.isLocalStreamAFile) {
+            this.stopConvert();
             this.HTMLInterface.pauseVideo();
           }
           this.YouTubeInterface.stopVideo();
@@ -543,6 +569,9 @@ export class App extends React.Component<AppProps, AppState> {
                   target = files[Number(fileIndex)];
                 }
                 if (!target) {
+                  target = pickSingleLargeFile(files);
+                }
+                if (!target) {
                   // Open the selector
                   // Selecting a file sets a new URL with the fileIndex set so we go through again
                   this.setMultiSelectModal(true);
@@ -590,8 +619,11 @@ export class App extends React.Component<AppProps, AppState> {
                 // for a live stream:
                 // html.currenttime is time since stream start
                 // html.duration is infinite
-                // player.duration is the seekable range
-                const isLiveStream = this.Player().getDuration() >= Infinity;
+                // html.seekable ends at the live edge (see getDuration)
+                // player.duration is the size of the seekable range, not a position
+                const isLiveStream = Boolean(
+                  window.watchparty.dash?.isDynamic(),
+                );
                 console.log("DASH stream initialized: isLive %s", isLiveStream);
                 this.setState({
                   isLiveStream,
@@ -625,7 +657,13 @@ export class App extends React.Component<AppProps, AppState> {
           //   player.load();
           //   player.play();
           // }
-          else {
+          else if (
+            this.state.convertEnabled &&
+            isClientTranscodeSupported() &&
+            isDirectVideoUrl(src)
+          ) {
+            await this.convertAndPlay(src, time);
+          } else {
             await this.Player().setSrcAndTime(src, time);
           }
           // Start this video
@@ -649,10 +687,6 @@ export class App extends React.Component<AppProps, AppState> {
               }
               // Resync to leader since the loading might have taken some time
               this.localSeek(ts);
-              if (this.state.uploadController) {
-                // Jump back to the start of the video
-                this.roomSeek(0);
-              }
               if (data.playbackRate) {
                 // Set playback rate again since it might have been lost
                 console.log("setting playback rate again", data.playbackRate);
@@ -1046,88 +1080,139 @@ export class App extends React.Component<AppProps, AppState> {
     this.socket.emit("CMD:deleteChatMessages", {});
   };
 
-  startConvert = async (sourceUrl?: string) => {
-    let stream = new ReadableStream();
-    let file: File;
-    if (!sourceUrl) {
-      const files = await openFileSelector();
-      if (!files) {
-        return;
-      }
-      file = files[0];
-      // Start uploading stream
-      stream = file.stream();
-    }
-    const uuid = createUuid();
-    const convertPath = this.context.convertPath;
-    // const convertPath = 'https://azure.howardchung.net:5001';
-    let convertUrl = convertPath + "/" + uuid + ".m3u8";
-    convertUrl += sourceUrl ? "?url=" + encodeURIComponent(sourceUrl) : "";
-    // Wait for the playlist to get generated
-    const poll = async () => {
-      let ok = false;
-      let i = 0;
-      while (!ok && i < 30) {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        const resp = await fetch(convertUrl);
-        ok = resp.ok;
-        i += 1;
-      }
-      // Same URL but GET
-      this.roomSetMedia(convertUrl);
-    };
-    poll();
-    const reader = stream.getReader();
-    const start = Date.now();
-    let bytes = 0;
-    const ws = new WebSocket(convertUrl.replace("http", "ws"));
-    ws.onmessage = async (_ev) => {
-      // Server sends a message whenever it wants next chunk
-      const { done, value } = await reader.read();
-      if (value) {
-        ws.send(value);
-      }
-      if (done) {
-        ws.close();
-      }
-      const end = Date.now();
-      bytes += value?.length ?? 0;
-      this.setState({
-        downloaded: bytes,
-        total: file?.size,
-        speed: done ? 0 : bytes / ((end - start) / 1000),
-        connections: 1,
-      });
-    };
-    ws.onclose = () => {
-      this.setState({ uploadController: undefined });
-    };
-    const controller = new AbortController();
-    controller.signal.onabort = (_ev) => {
-      ws.close();
-    };
-    this.setState({
-      uploadController: controller,
-    });
-    // Note: If using fetch we can't read the response until the request completes
-    // await fetch(convertUrl, {
-    //   method: 'POST',
-    //   body: stream,
-    //   signal: this.state.uploadController?.signal,
-    //   //@ts-expect-error
-    //   duplex: 'half',
-    // });
+  showError = (message: string) => {
+    this.setState({ errorMessage: message });
+    setTimeout(() => {
+      this.setState({ errorMessage: "" });
+    }, 3000);
   };
 
-  startFileShare = async (useMediaSoup: boolean) => {
+  // Stops client-side conversion (if running) and releases its resources
+  stopConvert = () => {
+    this.transcoder?.stop();
+    this.transcoder = undefined;
+    if (
+      this.state.convertProgress !== undefined ||
+      this.state.audioTracks !== undefined
+    ) {
+      this.setState({
+        convertProgress: undefined,
+        audioTracks: undefined,
+        audioTrackId: undefined,
+      });
+    }
+  };
+
+  // Switches the audio track of the file being converted (e.g. another language). Local to this device for links,
+  // for a shared file it changes what everyone hears since viewers receive the converted stream.
+  localSetAudioTrack = async (id: number) => {
+    try {
+      await this.transcoder?.selectAudioTrack(id);
+    } catch (err) {
+      console.error(err);
+      this.showError(
+        err instanceof Error ? err.message : "Unable to change audio track",
+      );
+    }
+  };
+
+  createTranscoder = (
+    source: File | string,
+    video: HTMLMediaElement,
+    startTime: number,
+    onError: (err: Error) => void,
+  ) => {
+    const transcoder = new ClientTranscoder({
+      source,
+      video,
+      startTime,
+      onProgress: (fraction) => {
+        if (this.transcoder === transcoder) {
+          this.setState({ convertProgress: fraction });
+        }
+      },
+      onAudioTracks: (audioTracks, audioTrackId) => {
+        if (this.transcoder === transcoder) {
+          this.setState({ audioTracks, audioTrackId });
+        }
+      },
+      onError,
+    });
+    this.transcoder = transcoder;
+    this.setState({ convertProgress: 0 });
+    return transcoder;
+  };
+
+  // Plays a media URL in this browser after converting it with WebCodecs (see clientTranscode.ts), for formats the
+  // browser can't play natively. Only affects this client: the room's media URL is unchanged.
+  convertAndPlay = async (src: string, time: number) => {
+    const video = this.HTMLInterface.getVideoEl();
+    const transcoder = this.createTranscoder(src, video, time, (err) => {
+      // Conversion failed while playing. Carry on without it.
+      this.showError(
+        `Conversion failed: ${err.message}. Playing without conversion.`,
+      );
+      this.stopConvert();
+      this.Player().setSrcAndTime(src, video.currentTime);
+    });
+    try {
+      await transcoder.start();
+    } catch (err) {
+      console.error(err);
+      if (this.transcoder === transcoder) {
+        // Typically a CORS restriction or a link that isn't a media file
+        this.stopConvert();
+        const reason =
+          err instanceof Error ? err.message : "Unable to convert this video";
+        this.showError(`${reason}. Playing without conversion.`);
+        await this.Player().setSrcAndTime(src, time);
+      }
+    }
+  };
+
+  // Shares a file from this device. With convert, the file is first transcoded in this browser using WebCodecs
+  // into a format browsers can play (see clientTranscode.ts), then shared the same way as an unconverted file.
+  startFileShare = async (
+    useMediaSoup: boolean,
+    options?: { convert?: boolean },
+  ) => {
     const files = await openFileSelector();
     if (!files) {
       return;
     }
     const file = files[0];
+    if (options?.convert && !isClientTranscodeSupported()) {
+      this.showError("Your browser doesn't support converting videos");
+      return;
+    }
+    this.stopConvert();
     this.Player().clearState();
     const leftVideo = this.HTMLInterface.getVideoEl();
-    leftVideo.src = URL.createObjectURL(file);
+    if (options?.convert) {
+      const transcoder = this.createTranscoder(file, leftVideo, 0, (err) => {
+        // Conversion failed mid-share
+        this.showError(`Conversion failed: ${err.message}`);
+        this.stopPublishingLocalStream();
+      });
+      try {
+        await transcoder.start();
+      } catch (err) {
+        console.error(err);
+        if (this.transcoder === transcoder) {
+          this.stopConvert();
+          this.showError(
+            err instanceof Error ? err.message : "Unable to convert this file",
+          );
+        }
+        return;
+      }
+      if (this.transcoder !== transcoder) {
+        // Cancelled while starting up
+        return;
+      }
+    } else {
+      leftVideo.src = URL.createObjectURL(file);
+    }
     leftVideo.play();
     //@ts-expect-error
     this.localStreamToPublish = leftVideo?.captureStream();
@@ -1518,6 +1603,7 @@ export class App extends React.Component<AppProps, AppState> {
   };
 
   stopPublishingLocalStream = async () => {
+    this.stopConvert();
     if (this.localStreamToPublish) {
       this.socket.emit("CMD:leaveScreenShare");
       // We don't actually need to unmute if it's a fileshare but this is fine
@@ -1781,12 +1867,26 @@ export class App extends React.Component<AppProps, AppState> {
     return this.playingScreenShare() || this.playingVBrowser();
   };
 
+  // The duration of the media. For a live stream this is the live edge on the same timeline as the current time,
+  // which is what hls.js reports as the duration. dash.js leaves it at Infinity, so use the end of the seekable range.
+  // The controls and seeking math below depend on it being finite.
+  getDuration = () => {
+    const duration = this.Player().getDuration();
+    if (this.state.isLiveStream && duration === Infinity) {
+      const seekable = this.Player().getVideoEl()?.seekable;
+      if (seekable?.length) {
+        return seekable.end(seekable.length - 1);
+      }
+    }
+    return duration;
+  };
+
   localSeek = (customTime?: number) => {
     // Jump to the leader's position, or a custom one
     let target = customTime ?? this.getLeaderTime();
     // For live this is the offset from the leading edge (negative)
     if (this.state.isLiveStream) {
-      target = this.Player().getDuration() + (customTime ?? 0);
+      target = this.getDuration() + (customTime ?? 0);
     }
     if (target >= 0 && target < Infinity) {
       console.log("syncing self to leader or custom:", target);
@@ -1886,7 +1986,7 @@ export class App extends React.Component<AppProps, AppState> {
     // Take the passed time and compute the offset from the end time (negative)
     // Each client should use this value to compute the time to set when starting playback
     if (this.state.isLiveStream) {
-      target = time - this.Player().getDuration();
+      target = time - this.getDuration();
     }
     // Otherwise just return the time
     return target;
@@ -1920,10 +2020,10 @@ export class App extends React.Component<AppProps, AppState> {
     // Default: fullscreen the body (theater mode)
     let container = document.body as HTMLElement;
     if (bVideoOnly || isMobile()) {
-      if (this.playingVBrowser() && !isMobile()) {
+      const vBrowserParent = document.getElementById("leftVideoParent");
+      if (this.playingVBrowser() && vBrowserParent?.requestFullscreen) {
         // vbrowser needs to fullscreen the control wrapper div
-        // Can't really control the VBrowser on mobile anyway, so just fullscreen the video
-        container = document.getElementById("leftVideoParent") as HTMLElement;
+        container = vBrowserParent;
       } else {
         // fullscreen just the video
         container = this.Player().getVideoEl();
@@ -1958,6 +2058,15 @@ export class App extends React.Component<AppProps, AppState> {
 
   roomSetMedia = (value: string) => {
     this.socket.emit("CMD:host", value);
+  };
+
+  setConvertEnabled = (convertEnabled: boolean) => {
+    window.localStorage.setItem(
+      "watchparty-convert",
+      convertEnabled ? "1" : "0",
+    );
+    this.setState({ convertEnabled });
+    window.location.reload();
   };
 
   roomPlaylistPlay = (index: number) => {
@@ -2051,6 +2160,9 @@ export class App extends React.Component<AppProps, AppState> {
   };
 
   onVideoEnded = (url: string) => {
+    if (this.state.loading) {
+      return;
+    }
     this.localPause();
     // check if looping is on, if so set time back to 0 and restart
     if (this.state.roomLoop) {
@@ -2099,7 +2211,7 @@ export class App extends React.Component<AppProps, AppState> {
         volume={this.Player().getVolume()}
         subtitled={this.Player().isSubtitled()}
         currentTime={this.Player().getCurrentTime()}
-        duration={this.Player().getDuration()}
+        duration={this.getDuration()}
         disabled={!this.haveLock()}
         leaderTime={this.hasDuration() ? this.getLeaderTime() : undefined}
         isPauseDisabled={this.isPauseDisabled()}
@@ -2119,6 +2231,9 @@ export class App extends React.Component<AppProps, AppState> {
         localSetSubtitleMode={this.Player().setSubtitleMode}
         roomPlaylistPlay={this.roomPlaylistPlay}
         playlist={this.state.playlist}
+        audioTracks={this.state.audioTracks}
+        audioTrackId={this.state.audioTrackId}
+        localSetAudioTrack={this.localSetAudioTrack}
       />
     );
     return (
@@ -2128,7 +2243,6 @@ export class App extends React.Component<AppProps, AppState> {
             streams={this.state.fileSelection}
             setMedia={this.roomSetMedia}
             resetMultiSelect={this.resetMultiSelect}
-            startConvert={this.startConvert}
           />
         )}
         {this.state.isVBrowserModalOpen && (
@@ -2147,7 +2261,6 @@ export class App extends React.Component<AppProps, AppState> {
           <FileShareModal
             closeModal={() => this.setState({ isFileShareModalOpen: false })}
             startFileShare={this.startFileShare}
-            startConvert={this.startConvert}
           />
         )}
         {this.state.isSubtitleModalOpen && (
@@ -2411,6 +2524,24 @@ export class App extends React.Component<AppProps, AppState> {
                               },
                             ]}
                           ></Select>
+                          {this.state.controller === clientId && (
+                            <Button
+                              color={
+                                this.state.vBrowserTouchControls
+                                  ? "teal"
+                                  : "grey"
+                              }
+                              onClick={() =>
+                                this.setState({
+                                  vBrowserTouchControls:
+                                    !this.state.vBrowserTouchControls,
+                                })
+                              }
+                              leftSection={<IconDeviceMobile />}
+                            >
+                              Touch Controls
+                            </Button>
+                          )}
                         </>
                       )}
                       {!this.localStreamToPublish &&
@@ -2430,17 +2561,6 @@ export class App extends React.Component<AppProps, AppState> {
                             File
                           </Button>
                         )}
-                      {this.state.uploadController && (
-                        <Button
-                          color="red"
-                          onClick={() => {
-                            this.state.uploadController?.abort();
-                          }}
-                          leftSection={<IconX />}
-                        >
-                          Stop Convert
-                        </Button>
-                      )}
                       {false && (
                         <SearchComponent
                           setMedia={this.roomSetMedia}
@@ -2513,6 +2633,23 @@ export class App extends React.Component<AppProps, AppState> {
                           )}
                         </Menu.Dropdown>
                       </Menu>
+                      {isClientTranscodeSupported() && (
+                        <Tooltip
+                          multiline
+                          w={280}
+                          refProp="rootRef"
+                          label="Use CPU/GPU to convert content before playback (only with links, use if video or audio doesn't play, or to choose between audio tracks)"
+                        >
+                          <Switch
+                            label="Convert"
+                            checked={this.state.convertEnabled}
+                            onChange={(e) =>
+                              this.setConvertEnabled(e.currentTarget.checked)
+                            }
+                            style={{ flexShrink: 0, alignSelf: "center" }}
+                          />
+                        </Tooltip>
+                      )}
                     </div>
                   </React.Fragment>
                 )}
@@ -2588,7 +2725,7 @@ export class App extends React.Component<AppProps, AppState> {
                       className={styles.videoContent}
                       allowFullScreen
                       frameBorder="0"
-                      allow="autoplay"
+                      allow="autoplay; encrypted-media"
                       src="https://www.youtube.com/embed/?enablejsapi=1&controls=0&rel=0"
                     />
                     {this.playingVBrowser() &&
@@ -2609,6 +2746,7 @@ export class App extends React.Component<AppProps, AppState> {
                           this.setState({ vBrowserQuality: data });
                         }}
                         isMobile={isMobile()}
+                        showTouchControls={this.state.vBrowserTouchControls}
                       />
                     ) : (
                       <video
@@ -2627,8 +2765,7 @@ export class App extends React.Component<AppProps, AppState> {
                         onClick={this.roomTogglePlay}
                       ></video>
                     )}
-                    {Boolean(this.state.total) && (
-                      <div
+                    <div
                         style={{
                           color: softWhite,
                           fontWeight: 400,
@@ -2640,17 +2777,19 @@ export class App extends React.Component<AppProps, AppState> {
                           zIndex: 1,
                         }}
                       >
-                        {Math.min(
+                        {[
+Boolean(this.state.total) && Math.min(
                           (this.state.downloaded / this.state.total) * 100,
                           100,
                         ).toFixed(2) +
-                          "% - " +
-                          formatSpeed(this.state.speed) +
-                          " - " +
-                          this.state.connections +
-                          " connections"}
-                      </div>
-                    )}
+                          "% downloaded",
+                          Boolean(this.state.total) && formatSpeed(this.state.speed),
+                          Boolean(this.state.total) && this.state.connections +
+                          " connections",
+this.state.convertProgress !== undefined && (this.state.convertProgress * 100).toFixed(1) +
+                        "% converted",
+                        ].filter(Boolean).join(" - ")}
+                    </div>
                   </div>
                 </div>
                 {this.state.roomMedia && controls}

@@ -1,5 +1,4 @@
 import config from "./config.ts";
-import { getUserByEmail } from "./utils/firebase.ts";
 import { insertObject, newPostgres, updateObject } from "./utils/postgres.ts";
 import { getAllActiveSubscriptions, getAllCustomers } from "./utils/stripe.ts";
 import { Client as DiscordClient, IntentsBitField } from "discord.js";
@@ -36,43 +35,29 @@ async function syncSubscribers() {
     getAllCustomers(),
   ]);
 
-  const emailMap = new Map();
+  const emailMap = new Map<string, string | null>();
+  const uidMap = new Map<string, string>();
   customers.forEach((cust) => {
     emailMap.set(cust.id, cust.email);
+    if (cust.metadata?.firebaseUid) {
+      uidMap.set(cust.id, cust.metadata.firebaseUid);
+    }
   });
 
   console.log("%s subs in Stripe", subs.length);
-
-  const uidMap = new Map();
-  for (let i = 0; i < subs.length; i += 50) {
-    // Batch customers and fetch firebase data
-    const batch = subs.slice(i, i + 50);
-    const fbUsers = await Promise.all(
-      batch
-        .map((sub) =>
-          emailMap.get(sub.customer)
-            ? getUserByEmail(emailMap.get(sub.customer))
-            : null,
-        )
-        .filter(Boolean),
-    );
-    fbUsers.forEach((user) => {
-      uidMap.set(user?.email, user?.uid);
-    });
-  }
 
   let noUID = 0;
   // Create sub objects
   let result = subs
     .map((sub) => {
-      let uid = uidMap.get(emailMap.get(sub.customer));
+      let uid = uidMap.get(sub.customer as string);
       if (!uid) {
-        uid = emailMap.get(sub.customer);
+        uid = emailMap.get(sub.customer as string) ?? undefined;
         noUID += 1;
       }
       return {
         customerId: sub.customer,
-        email: emailMap.get(sub.customer),
+        email: emailMap.get(sub.customer as string),
         status: sub.status,
         uid,
       };

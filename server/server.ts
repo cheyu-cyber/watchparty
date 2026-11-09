@@ -1,7 +1,6 @@
 import config from "./config.ts";
 import fs from "node:fs";
 import express, { type Response } from "express";
-import bodyParser from "body-parser";
 import compression from "compression";
 import cors from "cors";
 import https from "node:https";
@@ -11,32 +10,46 @@ import { searchYoutube, youtubePlaylist } from "./utils/youtube.ts";
 import { Room } from "./room.ts";
 import { redis, redisCount } from "./utils/redis.ts";
 import {
-  getCustomerByEmail,
+  getCustomerByUid,
   createSelfServicePortal,
-  getIsSubscriberByEmail,
+  getIsSubscriberByUid,
+  recordCheckoutSession,
+  stripe,
 } from "./utils/stripe.ts";
 import { deleteUser, validateUserToken } from "./utils/firebase.ts";
 import path from "node:path";
 import { getStartOfDay } from "./utils/time.ts";
 import { getSessionLimitSeconds } from "./vm/utils.ts";
 import { postgres, insertObject, upsertObject } from "./utils/postgres.ts";
-import axios, { isAxiosError } from "axios";
 import crypto from "node:crypto";
 import { gzipSync } from "node:zlib";
 import { resolveShard } from "./utils/resolveShard.ts";
 import { makeRoomName, makeUserName } from "./utils/moniker.ts";
 import { getStats } from "./utils/getStats.ts";
+import { assertPublicUrl, safeFetch } from "./utils/ssrf.ts";
 
-if (process.env.NODE_ENV === "development") {
-  axios.interceptors.request.use(
-    (config) => {
-      // console.log(config);
-      return config;
-    },
-    (error) => {
-      console.error(error);
-    },
-  );
+// Last-resort safety net: a stray rejected promise shouldn't take down every room on this shard.
+// Socket handlers are individually guarded in room.ts, this catches anything we missed.
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
+});
+
+// Run an async job on an interval without overlapping runs or unhandled rejections
+function safeInterval(name: string, fn: () => Promise<void>, ms: number) {
+  let running = false;
+  return setInterval(async () => {
+    if (running) {
+      return;
+    }
+    running = true;
+    try {
+      await fn();
+    } catch (e) {
+      console.warn("[%s] failed:", name, e);
+    } finally {
+      running = false;
+    }
+  }, ms);
 }
 
 const releaseInterval = 5 * 60 * 1000;
@@ -57,42 +70,49 @@ io.engine.use(async (req: any, res: Response, next: () => void) => {
   if (!roomId) {
     return next();
   }
-  // Attempt to ensure the room being connected to is loaded in memory
-  // If it doesn't exist, we may fail later with "invalid namespace"
-  const shard = resolveShard(roomId);
-  const key = "/" + roomId;
-  // Check to make sure this shard should load this room
-  const isCorrectShard = !config.SHARD || shard === Number(config.SHARD);
-  // Get the room data from postgres
-  const persistedRoom = (
-    await postgres?.query<PersistentRoom>(
-      `SELECT * from room where "roomId" = $1`,
-      [key],
-    )
-  )?.rows?.[0];
-  // Don't await after this because we may have a race condition where 2 rquests both try to load the room
-  if (isCorrectShard && !rooms.has(key)) {
-    const data = persistedRoom?.data
-      ? JSON.stringify(persistedRoom.data)
-      : undefined;
-    if (data) {
-      const room = new Room(io, key, data);
-      rooms.set(key, room);
-      console.log(
-        "loading room %s into memory on shard %s",
-        roomId,
-        config.SHARD,
-      );
+  try {
+    // Attempt to ensure the room being connected to is loaded in memory
+    // If it doesn't exist, we may fail later with "invalid namespace"
+    const shard = resolveShard(roomId);
+    const key = "/" + roomId;
+    // Check to make sure this shard should load this room
+    const isCorrectShard = !config.SHARD || shard === Number(config.SHARD);
+    if (isCorrectShard && !rooms.has(key)) {
+      // Get the room data from postgres
+      const persistedRoom = (
+        await postgres?.query<PersistentRoom>(
+          `SELECT * from room where "roomId" = $1`,
+          [key],
+        )
+      )?.rows?.[0];
+      // Re-check after the await in case a concurrent request already loaded the room
+      if (!rooms.has(key)) {
+        const data = persistedRoom?.data
+          ? JSON.stringify(persistedRoom.data)
+          : undefined;
+        if (data) {
+          const room = new Room(io, key, data);
+          rooms.set(key, room);
+          console.log(
+            "loading room %s into memory on shard %s",
+            roomId,
+            config.SHARD,
+          );
+        }
+      }
     }
+  } catch (e) {
+    // Fall through, the connection will fail later with "invalid namespace" if the room isn't loaded
+    console.warn("failed to load room %s:", roomId, e);
   }
   next();
 });
 
 const rooms = new Map<string, Room>();
 // Following functions iterate over in-memory rooms
-setInterval(minuteMetrics, 60 * 1000);
-setInterval(release, releaseInterval);
-setInterval(saveRooms, 1000);
+safeInterval("minuteMetrics", minuteMetrics, 60 * 1000);
+safeInterval("release", release, releaseInterval);
+safeInterval("saveRooms", saveRooms, 1000);
 if (process.env.NODE_ENV === "development") {
   try {
     import("./vmWorker.ts");
@@ -104,8 +124,8 @@ if (process.env.NODE_ENV === "development") {
 }
 
 app.use(cors());
-app.use(bodyParser.json());
-app.use(bodyParser.raw({ type: "text/plain", limit: 1000000 }));
+app.use(express.json());
+app.use(express.raw({ type: "text/plain", limit: 1000000 }));
 
 app.get("/ping", (_req, res) => {
   res.json("pong");
@@ -113,6 +133,10 @@ app.get("/ping", (_req, res) => {
 
 // Data's already compressed so go before the compression middleware
 app.get("/subtitle/:hash", async (req, res) => {
+  if (!/^[0-9a-f]{64}$/.test(req.params.hash)) {
+    res.status(404).end("not found");
+    return;
+  }
   const key = "subtitle:" + req.params.hash;
   const buf = await redis?.getBuffer(key);
   if (!buf) {
@@ -120,6 +144,10 @@ app.get("/subtitle/:hash", async (req, res) => {
     return;
   }
   await redis?.expire(key, 24 * 60 * 60);
+  // User-uploaded content served from our origin: make sure it can never be rendered as HTML
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'");
   res.setHeader("Content-Encoding", "gzip");
   res.end(buf);
 });
@@ -127,14 +155,20 @@ app.get("/subtitle/:hash", async (req, res) => {
 app.use(compression());
 
 app.post("/subtitle", async (req, res) => {
-  const data = req.body;
   if (!redis) {
+    res.status(503).json({ error: "subtitle storage is not available" });
+    return;
+  }
+  const data = req.body;
+  // body-parser only produces a Buffer for text/plain bodies
+  if (!Buffer.isBuffer(data) || data.length === 0) {
+    res.status(400).json({ error: "expected a non-empty text/plain body" });
     return;
   }
   // calculate hash, gzip and save to redis
   const hash = crypto
     .createHash("sha256")
-    .update(data, "utf8")
+    .update(data)
     .digest()
     .toString("hex");
   let gzipData = gzipSync(data);
@@ -146,97 +180,87 @@ app.post("/subtitle", async (req, res) => {
 app.get("/downloadSubtitles", async (req, res) => {
   // Request the URL from OS
   try {
-    const urlResp = await axios<{ link: string }>({
-      url: "https://api.opensubtitles.com/api/v1/download",
-      method: "POST",
-      headers: {
-        "User-Agent": "watchparty v1",
-        "Api-Key": config.OPENSUBTITLES_KEY,
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        // 'Authorization': 'Bearer ' + config.OPENSUBTITLES_KEY,
+    const urlResp = await fetch(
+      "https://api.opensubtitles.com/api/v1/download",
+      {
+        method: "POST",
+        headers: {
+          "User-Agent": "watchparty v1",
+          "Api-Key": config.OPENSUBTITLES_KEY,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          // 'Authorization': 'Bearer ' + config.OPENSUBTITLES_KEY,
+        },
+        body: JSON.stringify({
+          file_id: req.query.file_id,
+          // sub_format: 'srt',
+        }),
       },
-      data: {
-        file_id: req.query.file_id,
-        // sub_format: 'srt',
-      },
-    });
+    );
+    if (!urlResp.ok) {
+      throw new Error(`OpenSubtitles download failed: ${urlResp.status}`);
+    }
+    const urlData: { link: string } = await urlResp.json();
     redisCount("subDownloadsOS");
     if (!redis) {
       // Return the direct link to the user, will work for about 3 hours
-      res.json(urlResp.data);
+      res.json(urlData);
       return;
     }
     // Cache the contents in Redis (longer retention)
-    const subResp = await axios.get(urlResp.data.link, {
-      responseType: "arraybuffer",
-    });
-    const data = subResp.data;
+    const subResp = await fetch(urlData.link);
+    if (!subResp.ok) {
+      throw new Error(`Subtitle file fetch failed: ${subResp.status}`);
+    }
+    const data = Buffer.from(await subResp.arrayBuffer());
     const hash = crypto
       .createHash("sha256")
-      .update(data, "utf8")
+      .update(data)
       .digest()
       .toString("hex");
     let gzipData = gzipSync(data);
     await redis.setex("subtitle:" + hash, 24 * 60 * 60, gzipData);
     res.json({ link: "/subtitle/" + hash });
   } catch (e) {
-    if (isAxiosError(e)) {
-      console.log(e.response);
-    }
+    console.log(e);
     throw e;
   }
 });
 
 app.get("/searchSubtitles", async (req, res) => {
+  let result: unknown = [];
   try {
-    const title = req.query.title ? String(req.query.title) : "";
-    const url = req.query.url ? String(req.query.url) : "";
-    let subUrl = "";
-    if (url) {
-      const startResp = await axios({
-        method: "get",
-        url: url,
-        headers: {
-          Range: "bytes=0-65535",
-        },
-        responseType: "arraybuffer",
-      });
-      const start = startResp.data;
-      const size = Number(startResp.headers["content-range"].split("/")[1]);
-      const endResp = await axios({
-        method: "get",
-        url: url,
-        headers: {
-          Range: `bytes=${size - 65536}-`,
-        },
-        responseType: "arraybuffer",
-      });
-      const end = endResp.data;
-      // console.log(start, end, size);
-      let hash = computeOpenSubtitlesHash(start, end, size);
-      // hash = 'f65334e75574f00f';
-      // Search API for subtitles by hash
-      subUrl = `https://api.opensubtitles.com/api/v1/subtitles?moviehash=${hash}&languages=en`;
-    } else if (title) {
-      subUrl = `https://api.opensubtitles.com/api/v1/subtitles?query=${title}&languages=en`;
+    const title =
+      typeof req.query.title === "string" ? req.query.title.slice(0, 200) : "";
+    let params: URLSearchParams | undefined = undefined;
+    if (title) {
+      params = new URLSearchParams({ languages: "en", query: title });
     }
-    // Alternative, web client calls this to get back some JS with the download URL embedded
-    // https://www.opensubtitles.com/nocache/download/7585196/subreq.js?file_name=Borgen.S04E01.en&locale=en&np=true&sub_frmt=srt&subtitle_id=6615808&ext_installed=false
-    // Up to 10 downloads per IP per day, but proxyable and doesn't require key
-    const response = await axios.get(subUrl, {
-      headers: {
-        "User-Agent": "watchparty v1",
-        "Api-Key": config.OPENSUBTITLES_KEY,
-      },
-    });
-    // console.log(subUrl, response.data);
-    const subtitles = response.data;
-    res.json(subtitles.data);
+    if (params) {
+      // Alternative, web client calls this to get back some JS with the download URL embedded
+      // https://www.opensubtitles.com/nocache/download/7585196/subreq.js?file_name=Borgen.S04E01.en&locale=en&np=true&sub_frmt=srt&subtitle_id=6615808&ext_installed=false
+      // Up to 10 downloads per IP per day, but proxyable and doesn't require key
+      const response = await fetch(
+        // URLSearchParams URL-encodes these, so titles like "Law & Order" survive intact
+        `https://api.opensubtitles.com/api/v1/subtitles?${params}`,
+        {
+          headers: {
+            "User-Agent": "watchparty v1",
+            "Api-Key": config.OPENSUBTITLES_KEY,
+          },
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`OpenSubtitles search failed: ${response.status}`);
+      }
+      const data = await response.json();
+      result = data.data;
+    }
   } catch (e: any) {
     console.error(e.message);
-    res.json([]);
+    result = [];
   }
+  res.json(result ?? []);
   redisCount("subSearchesOS");
 });
 
@@ -250,9 +274,10 @@ app.get("/stats", async (req, res) => {
 });
 
 app.get("/health/:metric", async (req, res) => {
-  const vmManagerStats = (
-    await axios.get("http://localhost:" + config.VMWORKER_PORT + "/stats")
-  ).data;
+  const resp = await fetch(
+    "http://localhost:" + config.VMWORKER_PORT + "/stats",
+  );
+  const vmManagerStats = await resp.json();
   const result = vmManagerStats[req.params.metric]?.availableVBrowsers?.length;
   res.status(result ? 200 : 500).json(result);
 });
@@ -291,41 +316,153 @@ app.get("/youtubePlaylist/:playlistId", async (req, res) => {
 });
 
 app.post("/createRoom", async (req, res) => {
-  const genName = () => "/" + makeRoomName(config.SHARD);
-  let name = genName();
+  // Pick a name nobody else is using. Collisions in memory or in the DB just retry.
+  let name = "";
+  for (let attempt = 0; attempt < 5 && !name; attempt++) {
+    const candidate = "/" + makeRoomName(config.SHARD);
+    if (rooms.has(candidate)) {
+      continue;
+    }
+    if (postgres) {
+      const now = new Date();
+      try {
+        await insertObject(postgres, "room", {
+          roomId: candidate,
+          lastUpdateTime: now,
+          creationTime: now,
+        });
+      } catch (e) {
+        console.error(e);
+        redisCount("createRoomError");
+        continue;
+      }
+    }
+    name = candidate;
+  }
+  if (!name) {
+    res.status(503).json({ error: "could not allocate a room name" });
+    return;
+  }
   console.log("createRoom: ", name);
+  // Only construct the Room once the name is secured, since it registers a namespace and a timer
   const newRoom = new Room(io, name);
-  if (postgres) {
-    const now = new Date();
-    const roomObj = {
-      roomId: newRoom.roomId,
-      lastUpdateTime: now,
-      creationTime: now,
-    };
-    try {
-      await insertObject(postgres, "room", roomObj);
-    } catch (e) {
-      redisCount("createRoomError");
-      throw e;
-    }
-  }
-  const decoded = await validateUserToken(req.body?.uid, req.body?.token);
-  newRoom.creator = decoded?.email;
-  const preload = (req.body?.video || "").slice(0, 20000);
-  if (preload) {
-    redisCount("createRoomPreload");
-    newRoom.video = preload;
-    newRoom.paused = true;
-    await newRoom.saveRoom();
-  }
-  const prePlaylist = Array.isArray(req.body?.playlist) && req.body?.playlist;
-  if (prePlaylist) {
-    for (let item of req.body.playlist) {
-      newRoom.playlistAdd(null, item);
-    }
-  }
   rooms.set(name, newRoom);
+  try {
+    const decoded = await validateUserToken(req.body?.uid, req.body?.token);
+    newRoom.creator = decoded?.email;
+    const preload =
+      typeof req.body?.video === "string" ? req.body.video.slice(0, 20000) : "";
+    if (preload) {
+      redisCount("createRoomPreload");
+      newRoom.video = preload;
+      newRoom.paused = true;
+      await newRoom.saveRoom();
+    }
+    // Only accept reasonably sized strings, cap the number of items
+    const prePlaylist: string[] = Array.isArray(req.body?.playlist)
+      ? req.body.playlist
+          .filter(
+            (item: unknown): item is string =>
+              typeof item === "string" &&
+              item.length > 0 &&
+              item.length <= 20000,
+          )
+          .slice(0, 25)
+      : [];
+    if (prePlaylist.length) {
+      // Add in order in the background, a failing item shouldn't affect the others or the request
+      (async () => {
+        for (const item of prePlaylist) {
+          try {
+            await newRoom.playlistAdd(null, item);
+          } catch (e) {
+            console.warn(e);
+          }
+        }
+      })();
+    }
+  } catch (e) {
+    // Don't leave a half-created room (and its timer/namespace) behind
+    newRoom.destroy();
+    rooms.delete(name);
+    throw e;
+  }
   res.json({ name });
+});
+
+app.post("/checkoutSub", async (req, res) => {
+  const decoded = await validateUserToken(
+    String(req.body?.uid),
+    String(req.body?.token),
+  );
+  if (!decoded) {
+    res.status(400).json({ error: "invalid user token" });
+    return;
+  }
+  // Don't let a user subscribe twice
+  if (postgres) {
+    const { rows } = await postgres.query(
+      "SELECT 1 FROM subscriber WHERE uid = $1 AND status = 'active'",
+      [decoded.uid],
+    );
+    if (rows.length) {
+      res.status(400).json({ error: "already subscribed" });
+      return;
+    }
+  }
+  const returnUrl = req.body?.return_url
+  if (!returnUrl) {
+    res.status(400).json({ error: "invalid return_url" });
+    return;
+  }
+  // Stripe redirects to success_url on our server first, so we can record the subscription
+  // before sending the user back to their room
+  const proto = (req.get("x-forwarded-proto") ?? req.protocol)
+    .split(",")[0]
+    .trim();
+  const serverUrl = `${proto === "https" ? "https" : "http"}://${req.get("host")}`;
+  // Reuse the existing customer for this user, or create one tagged with their UID
+  // so we can find it later even if their email changes
+  const customer =
+    (await getCustomerByUid(decoded.uid)) ??
+    (await stripe.customers.create({
+      email: decoded.email,
+      metadata: { firebaseUid: decoded.uid },
+    }));
+  const session = await stripe.checkout.sessions.create({
+    mode: "subscription",
+    allow_promotion_codes: true,
+    client_reference_id: decoded.uid,
+    customer: customer.id,
+    line_items: [
+      {
+        price:
+          config.NODE_ENV === "development"
+            ? "price_HNGtabCzD5qyfd"
+            : "price_HNDBoPDI7yYRi9",
+        quantity: 1,
+      },
+    ],
+    // {CHECKOUT_SESSION_ID} is filled in by Stripe, so it must not be URL-encoded
+    success_url: `${serverUrl}/subSuccess?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: returnUrl,
+    // /subSuccess redirects here. Stored on the session (not in the success URL) so
+    // the redirect target can't be changed by editing a link.
+    metadata: { return_url: returnUrl },
+  });
+  res.json({ url: session.url });
+});
+
+// Stripe sends the user here after a successful checkout
+app.get("/subSuccess", async (req, res) => {
+  const sessionId =
+    typeof req.query.session_id === "string" ? req.query.session_id : "";
+  let returnUrl: string | undefined = undefined;
+  const result = await recordCheckoutSession(sessionId);
+  returnUrl = result.returnUrl;
+  // Only ever redirect to the URL we validated and stored when creating the session
+  // (never to something from this request's query string). If we couldn't read it, go home.
+  res.redirect(returnUrl || "/");
 });
 
 app.post("/manageSub", async (req, res) => {
@@ -337,11 +474,7 @@ app.post("/manageSub", async (req, res) => {
     res.status(400).json({ error: "invalid user token" });
     return;
   }
-  if (!decoded.email) {
-    res.status(400).json({ error: "no email found" });
-    return;
-  }
-  const customer = await getCustomerByEmail(decoded.email);
+  const customer = await getCustomerByUid(decoded.uid);
   if (!customer) {
     res.status(400).json({ error: "customer not found" });
     return;
@@ -351,6 +484,28 @@ app.post("/manageSub", async (req, res) => {
     req.body?.return_url,
   );
   res.json(session);
+});
+
+app.post("/updateEmail", async (req, res) => {
+  const decoded = await validateUserToken(
+    String(req.body?.uid),
+    String(req.body?.token),
+  );
+  if (!decoded) {
+    res.status(400).json({ error: "invalid user token" });
+    return;
+  }
+  const email =
+    typeof req.body?.email === "string" ? req.body.email.trim() : "";
+  if (!email) {
+    res.status(400).json({ error: "invalid email" });
+    return;
+  }
+  const customer = await getCustomerByUid(decoded.uid);
+  if (customer) {
+    await stripe.customers.update(customer.id, { email });
+  }
+  res.json({});
 });
 
 app.delete("/deleteAccount", async (req, res) => {
@@ -378,16 +533,16 @@ app.get("/metadata", async (req, res) => {
     String(req.query?.uid),
     String(req.query?.token),
   );
-  let isSubscriber = await getIsSubscriberByEmail(decoded?.email);
+  let isSubscriber = await getIsSubscriberByUid(decoded?.uid);
   // Has the user ever been a subscriber?
-  // const customer = await getCustomerByEmail(decoded.email);
+  // const customer = await getCustomerByUid(decoded.uid);
   let isFreePoolFull = false;
   try {
-    isFreePoolFull = (
-      await axios.get(
-        "http://localhost:" + config.VMWORKER_PORT + "/isFreePoolFull",
-      )
-    ).data.isFull;
+    const resp = await fetch(
+      "http://localhost:" + config.VMWORKER_PORT + "/isFreePoolFull",
+    );
+    const data = await resp.json();
+    isFreePoolFull = data.isFull;
   } catch (e: any) {
     console.warn("[WARNING]: free pool check failed: %s", e.code);
   }
@@ -395,7 +550,6 @@ app.get("/metadata", async (req, res) => {
     decoded?.email != null &&
     Boolean(config.BETA_USER_EMAILS.split(",").includes(decoded?.email));
   const streamPath = beta ? config.STREAM_PATH : undefined;
-  const convertPath = isSubscriber ? config.CONVERT_PATH : undefined;
   // log metrics but don't wait for it
   if (postgres && decoded?.uid) {
     upsertObject(
@@ -410,7 +564,6 @@ app.get("/metadata", async (req, res) => {
     isFreePoolFull,
     beta,
     streamPath,
-    convertPath,
   });
 });
 
@@ -516,14 +669,19 @@ app.post("/linkAccount", async (req, res) => {
     const tokenType = req.body?.tokenType;
     const accessToken = req.body.accessToken;
     // Get the token and verify the user
-    const response = await axios.get("https://discord.com/api/users/@me", {
+    const response = await fetch("https://discord.com/api/users/@me", {
       headers: {
         authorization: `${tokenType} ${accessToken}`,
       },
     });
-    const accountid = response.data.id;
-    const accountname = response.data.username;
-    const discriminator = response.data.discriminator;
+    if (!response.ok) {
+      res.status(400).json({ error: "invalid discord token" });
+      return;
+    }
+    const data = await response.json();
+    const accountid = data.id;
+    const accountname = data.username;
+    const discriminator = data.discriminator;
     // Store the user id, username, discriminator
     await upsertObject(
       postgres,
@@ -569,47 +727,56 @@ app.get("/generateName", async (req, res) => {
 });
 
 // Proxy video segments
+// Hostname only: no scheme, port, userinfo or path, so it can't be used to redirect the request elsewhere
+const PROXY_HOST_RE =
+  /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i;
 app.get("/proxy/*splat", async (req, res) => {
   redisCount("proxyReqs");
   try {
     const parsed = new URL("http://localhost" + req.url);
     const pathname = parsed.pathname.slice("/proxy".length);
-    const host = parsed.searchParams.get("host");
+    const host = parsed.searchParams.get("host") ?? "";
+    if (!PROXY_HOST_RE.test(host)) {
+      res.status(400).end();
+      return;
+    }
+    const upstream = new URL("https://" + host + pathname);
+    if (upstream.hostname !== host.toLowerCase()) {
+      res.status(400).end();
+      return;
+    }
+    // Refuse private/loopback addresses (hostnames are re-checked when connecting)
+    assertPublicUrl(upstream);
+    // Upstream content is untrusted, never let it be interpreted as HTML on our origin
+    res.setHeader("X-Content-Type-Options", "nosniff");
     if (pathname.endsWith("index-dvr.m3u8")) {
       // VOD
       // https://d2vjef5jvl6bfs.cloudfront.net/3012391a6c3e84c79ef6_gamesdonequick_41198403369_1681059003/chunked/index-dvr.m3u8
-      const resp = await axios.get("https://" + host + pathname);
+      const resp = await safeFetch(upstream);
+      const data = await resp.text();
       const re2 = /(.*.ts)/g;
-      let repl = resp.data.replaceAll(re2, `$1?host=${host}`);
+      let repl = String(data).replaceAll(re2, `$1?host=${host}`);
       // Mark this as a VOD
       repl += "#EXT-X-ENDLIST";
-      res.send(repl);
+      res.type("application/vnd.apple.mpegurl").send(repl);
     } else if (pathname.endsWith(".m3u8")) {
       // Stream
-      // https://video-weaver.sea02.hls.ttvnw.net/v1/playlist/CrQEgv7Mz6nnsfJH3XtVQxeYXk8mViy1zNGWglcybvxZsI1rv3iLnjAnnqwCiVXCJ-DdD27J6RuFrLy7YUYwHUCKazIKICIupUCn9UXtaBYhBM5JIYqg9dz6NWYrCWU9HZJj2TGROv9mAOKuTR51YS82hdYL4PFZa3xxWXhgDsxXQHNDB03kY6S0aG0-EVva1xYrn5Ge6IAXRwug9QDGlb-ydtF3BtYppoTklVI7CVLySPPwbbt5Ow1JXdnKhLSwQEs4bh3BLwMnRBwUFI5nmE18BLYbkMOUivgYP5SSMgnGGlSkJO-iJNPWvepunEgyBUzB_7L-b1keTcV-Qak9IcWIITIWbRvmg6qB3ZSuWdcJgWKmdXdIn4qoRM4o16G1_0N_WRqPtMQFo0hmTlAVmHrzRArJQmaSgqAxZxRbFMd9RFeX6qjP9NtwguPbSeStdVbQxMNC34iavYUIxo8Ug812BHsG7J_kIlof2zkIqkEbP3oV3UkSByIo7xh9EEVargjaGDuQRt8zPQ6-fNBWJJe9F6IFu7lXBPIJ016lopyfcvTWjbLbBHsVkg6vG-3UISh0nud7KB5g5ipQePhtcFSI5hvjlfX1DAVHEpTWXkvlnL4wNqEqpBYL2btSXYeE1Cb-RAvrAT0s61usERcL2eI-S5aTcSO8_hxQ2afC7c9vlypOWgP6p6XNpViZHXmdXv4t-d68Z-MpLtSU7VbB3pRWnSswFFyA3W39ITic4lb97Djp3wHhGgz0Sy8aDb9r0tnphIYgASoJdXMtZWFzdC0yMKQG.m3u8
+      // https://video-weaver.sea02.hls.ttvnw.net/v1/playlist/<token>.m3u8
       // Extract the edge URL host and add it to URL so proxy can fetch
-      const resp = await axios.get("https://" + host + pathname);
-      // const re = /https:\/\/(.*)\/v1\/segment\/(.*)/g;
-      // const match = re.exec(resp.data);
-      // const edgehost = match?.[1];
-      // const repl = resp.data.replaceAll(
-      //   re,
-      //   `/proxy/v1/segment/$2?host=${edgehost}`,
-      // );
-      const repl = resp.data;
-      res.send(repl);
+      const resp = await safeFetch(upstream);
+      const data = await resp.text();
+      res.type("application/vnd.apple.mpegurl").send(String(data));
     } else if (pathname.endsWith(".ts")) {
       // Segment
-      const resp = await axios.get("https://" + host + pathname, {
-        responseType: "arraybuffer",
-      });
+      const resp = await safeFetch(upstream);
+      const data = Buffer.from(await resp.arrayBuffer());
       res.writeHead(200, {
         "Content-Type": "application/octet-stream",
         "Accept-Ranges": "bytes",
-        "Content-Length": resp.data.length,
+        "Content-Length": data.length,
         "Transfer-Encoding": "chunked",
       });
-      res.write(resp.data);
+      res.write(data);
       res.end();
     } else {
       res.status(404);
@@ -618,6 +785,12 @@ app.get("/proxy/*splat", async (req, res) => {
   } catch (e) {
     // console.log(e);
     console.log("proxy failed: %s", req.url);
+    // Always answer, otherwise the client hangs until it times out
+    if (!res.headersSent) {
+      res.status(502).end();
+    } else {
+      res.end();
+    }
   }
 });
 
@@ -724,41 +897,46 @@ async function minuteMetrics() {
   const roomArr = Array.from(rooms.values());
   let vbWaiting = 0;
   for (let room of roomArr) {
-    if (room.vBrowser && room.vBrowser.id) {
-      // Update the heartbeat
-      await postgres?.query(
-        `UPDATE vbrowser SET "heartbeatTime" = NOW() WHERE "roomId" = $1 and vmid = $2`,
-        [room.roomId, room.vBrowser.id],
-      );
+    try {
+      if (room.vBrowser && room.vBrowser.id) {
+        // Update the heartbeat
+        await postgres?.query(
+          `UPDATE vbrowser SET "heartbeatTime" = NOW() WHERE "roomId" = $1 and vmid = $2`,
+          [room.roomId, room.vBrowser.id],
+        );
 
-      const expireTime = getStartOfDay() / 1000 + 86400;
-      if (room.vBrowser?.creatorClientID) {
-        await redis?.zincrby(
-          "vBrowserClientIDMinutes",
-          1,
-          room.vBrowser.creatorClientID,
-        );
-        await redis?.expireat("vBrowserClientIDMinutes", expireTime);
+        const expireTime = getStartOfDay() / 1000 + 86400;
+        if (room.vBrowser?.creatorClientID) {
+          await redis?.zincrby(
+            "vBrowserClientIDMinutes",
+            1,
+            room.vBrowser.creatorClientID,
+          );
+          await redis?.expireat("vBrowserClientIDMinutes", expireTime);
+        }
+        if (room.vBrowser?.creatorUID) {
+          await redis?.zincrby(
+            "vBrowserUIDMinutes",
+            1,
+            room.vBrowser?.creatorUID,
+          );
+          await redis?.expireat("vBrowserUIDMinutes", expireTime);
+        }
       }
-      if (room.vBrowser?.creatorUID) {
-        await redis?.zincrby(
-          "vBrowserUIDMinutes",
-          1,
-          room.vBrowser?.creatorUID,
+      const users = room.roster.length;
+      if (users) {
+        await redis?.setex(`roomCounts:${room.roomId}`, 120, users);
+        await redis?.setex(
+          `roomRosters:${room.roomId}`,
+          120,
+          JSON.stringify(room.getRosterForStats()),
         );
-        await redis?.expireat("vBrowserUIDMinutes", expireTime);
       }
+      vbWaiting += room.vBrowserQueue ? 1 : 0;
+    } catch (e) {
+      // One room's failure shouldn't stop metrics for the rest
+      console.warn("[minuteMetrics] room %s failed:", room.roomId, e);
     }
-    const users = room.roster.length;
-    if (users) {
-      await redis?.setex(`roomCounts:${room.roomId}`, 120, users);
-      await redis?.setex(
-        `roomRosters:${room.roomId}`,
-        120,
-        JSON.stringify(room.getRosterForStats()),
-      );
-    }
-    vbWaiting += room.vBrowserQueue ? 1 : 0;
   }
   // Report shard metrics
   const obj: ShardMetric = {
@@ -773,21 +951,4 @@ async function minuteMetrics() {
     120,
     JSON.stringify(obj),
   );
-}
-
-function computeOpenSubtitlesHash(first: Buffer, last: Buffer, size: number) {
-  // console.log(first.length, last.length, size);
-  let temp = BigInt(size);
-  process(first);
-  process(last);
-
-  temp = temp & BigInt("0xffffffffffffffff");
-  return temp.toString(16).padStart(16, "0");
-
-  function process(chunk: Buffer) {
-    for (let i = 0; i < chunk.length; i += 8) {
-      const long = chunk.readBigUInt64LE(i);
-      temp += long;
-    }
-  }
 }

@@ -3,6 +3,7 @@ import { Badge, Button, Menu, Progress, Slider } from "@mantine/core";
 import { formatTimestamp, softWhite } from "../../utils/utils";
 import styles from "./Controls.module.css";
 import { MetadataContext } from "../../MetadataContext";
+import type { AudioTrackInfo } from "../../utils/clientTranscode";
 import {
   IconPlayerPlayFilled,
   IconPlayerPauseFilled,
@@ -10,6 +11,7 @@ import {
   IconCheck,
   IconRepeat,
   IconBadgeCc,
+  IconHeadphones,
   IconVolumeOff,
   IconVolume,
   IconTheater,
@@ -46,6 +48,10 @@ interface ControlsProps {
   localSetSubtitleMode: (mode: TextTrackMode, lang?: string) => void;
   roomPlaylistPlay: (index: number) => void;
   playlist: PlaylistVideo[];
+  /** Audio tracks of the file being converted on this device (only set when there's a choice to make) */
+  audioTracks?: AudioTrackInfo[];
+  audioTrackId?: number;
+  localSetAudioTrack?: (id: number) => void;
 }
 
 export const Controls = (props: ControlsProps) => {
@@ -59,9 +65,16 @@ export const Controls = (props: ControlsProps) => {
   const getLength = () => getEnd() - getStart();
   const getCurrent = () => props.currentTime;
   const getPercent = () => (getCurrent() - getStart()) / getLength();
+  // The wall clock time that media time 0 corresponds to, for live streams where the duration is the live edge.
+  // Only computed once the duration is known: an infinite one (e.g. a DASH stream before it has a seekable range)
+  // would give a time that is never valid, and the memo wouldn't recompute when the duration later became finite.
+  const hasFiniteDuration = Number.isFinite(props.duration);
   const zeroTime = useMemo(
-    () => Math.floor(Date.now() / 1000) - props.duration,
-    [props.video, Boolean(props.duration)],
+    () =>
+      hasFiniteDuration
+        ? Math.floor(Date.now() / 1000) - props.duration
+        : undefined,
+    [props.video, hasFiniteDuration],
   );
   const onMouseOver = () => {
     setShowTimestamp(true);
@@ -344,6 +357,32 @@ export const Controls = (props: ControlsProps) => {
           title="Captions"
           color={subtitled ? "green" : softWhite}
         />
+      )}
+      {props.audioTracks && props.audioTracks.length > 1 && (
+        // Local to this device, so unlike the room controls it isn't affected by the lock
+        <Menu>
+          <Menu.Target>
+            <IconHeadphones
+              className={styles.action}
+              title="Audio track"
+              color={softWhite}
+            />
+          </Menu.Target>
+          <Menu.Dropdown>
+            <Menu.Label>Audio track</Menu.Label>
+            {props.audioTracks.map((track) => (
+              <Menu.Item
+                key={track.id}
+                onClick={() => props.localSetAudioTrack?.(track.id)}
+                rightSection={
+                  props.audioTrackId === track.id ? <IconCheck /> : null
+                }
+              >
+                {track.label}
+              </Menu.Item>
+            ))}
+          </Menu.Dropdown>
+        </Menu>
       )}
       <IconTheater
         onClick={() => localFullScreen(false)}
