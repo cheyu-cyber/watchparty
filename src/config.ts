@@ -36,7 +36,7 @@ export default {
   // Override at build time:
   //   VITE_MAX_VIDEO_BITRATE_KBPS=12000 docker compose build app --no-cache
   VITE_MAX_VIDEO_BITRATE_KBPS: Number(
-    import.meta.env.VITE_MAX_VIDEO_BITRATE_KBPS ?? 3200,
+    import.meta.env.VITE_MAX_VIDEO_BITRATE_KBPS ?? 3000,
   ),
   // Opus audio bitrate for screen / file share, in kbps.  Upstream
   // hardcoded 510 kbps (effectively lossless overkill) for both the
